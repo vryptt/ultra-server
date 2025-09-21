@@ -121,6 +121,7 @@ int set_socket_optimizations(int fd) {
 }
 
 void setup_cpu_affinity(int thread_id, int total_threads) {
+    (void)total_threads;
     cpu_set_t cpuset;
     int cpu_id = thread_id % sysconf(_SC_NPROCESSORS_ONLN);
     
@@ -342,6 +343,7 @@ void send_response_optimized(int client_fd, const response_t *response, server_s
 }
 
 void send_stats_response_optimized(int client_fd, worker_thread_t *worker) {
+    (void)client_fd;
     char *json_buffer = (char*)allocate_from_pool(worker, 4096);
     time_t current_time = time(NULL);
     double uptime = difftime(current_time, worker->stats->start_time);
@@ -383,6 +385,7 @@ void send_stats_response_optimized(int client_fd, worker_thread_t *worker) {
         "  \"timestamp\": \"%s\"\n"
         "}\n",
 void send_stats_response_optimized(int client_fd, worker_thread_t *worker) {
+    (void)client_fd;
     char *json_buffer = (char*)allocate_from_pool(worker, 4096);
     time_t current_time = time(NULL);
     double uptime = difftime(current_time, worker->stats->start_time);
