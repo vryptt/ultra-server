@@ -153,7 +153,7 @@ void *allocate_from_pool(worker_thread_t *worker, size_t size) {
 }
 
 void prefetch_data(const void *addr) {
-    __builtin_prefetch(addr, 0, 3);
+    prefetch_data_inline(addr);
 }
 
 void *io_thread_func(void *arg) {
@@ -208,7 +208,7 @@ void *io_thread_func(void *arg) {
                     connection_t conn = {
                         .client_fd = client_fd,
                         .client_addr = client_addr,
-                        .timestamp = __builtin_ia32_rdtsc()
+                        .timestamp = get_cpu_cycles()
                     };
                     
                     if (!ring_buffer_push(io_worker->ring_buffer, &conn)) {
@@ -294,7 +294,7 @@ void handle_client_optimized(int client_fd, worker_thread_t *worker) {
     ssize_t bytes_read;
     
     // Prefetch buffer
-    prefetch_data(buffer);
+    prefetch_data_inline(buffer);
     
     bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, MSG_DONTWAIT);
     if (bytes_read <= 0) {
@@ -308,7 +308,7 @@ void handle_client_optimized(int client_fd, worker_thread_t *worker) {
     atomic_fetch_add(&worker->stats->total_requests, 1);
     atomic_fetch_add(&worker->local_requests, 1);
     
-    // Fast path request matching using SIMD
+    // Fast path request matching
     int endpoint = fast_path_match(buffer, bytes_read);
     
     switch (endpoint) {
@@ -382,6 +382,47 @@ void send_stats_response_optimized(int client_fd, worker_thread_t *worker) {
         "  },\n"
         "  \"timestamp\": \"%s\"\n"
         "}\n",
+void send_stats_response_optimized(int client_fd, worker_thread_t *worker) {
+    char *json_buffer = (char*)allocate_from_pool(worker, 4096);
+    time_t current_time = time(NULL);
+    double uptime = difftime(current_time, worker->stats->start_time);
+    
+    // Build comprehensive JSON response
+    int len = snprintf(json_buffer, 4096,
+        "{\n"
+        "  \"server\": \"Ultra-Fast Multi-Core HTTP Server\",\n"
+        "  \"version\": \"2.0\",\n"
+        "  \"uptime_seconds\": %.0f,\n"
+        "  \"performance\": {\n"
+        "    \"total_requests\": %lu,\n"
+        "    \"get_requests\": %lu,\n"
+        "    \"stats_requests\": %lu,\n"
+        "    \"requests_per_second\": %lu,\n"
+        "    \"bytes_sent\": %lu,\n"
+        "    \"bytes_received\": %lu\n"
+        "  },\n"
+        "  \"connections\": {\n"
+        "    \"active\": %lu,\n"
+        "    \"peak\": %lu\n"
+        "  },\n"
+        "  \"system\": {\n"
+        "    \"worker_threads\": %d,\n"
+        "    \"cpu_cores\": %ld,\n"
+        "    \"cache_hits\": %lu,\n"
+        "    \"cache_misses\": %lu,\n"
+        "    \"memory_allocations\": %lu\n"
+        "  },\n"
+        "  \"errors\": {\n"
+        "    \"total_errors\": %lu,\n"
+        "    \"error_rate\": %.2f\n"
+        "  },\n"
+        "  \"thread_stats\": {\n"
+        "    \"thread_id\": %d,\n"
+        "    \"local_requests\": %lu,\n"
+        "    \"local_bytes_sent\": %lu\n"
+        "  },\n"
+        "  \"timestamp\": \"%.24s\"\n"
+        "}",
         uptime,
         atomic_load(&worker->stats->total_requests),
         atomic_load(&worker->stats->get_requests),
@@ -404,12 +445,6 @@ void send_stats_response_optimized(int client_fd, worker_thread_t *worker) {
         ctime(&current_time)
     );
     
-    // Remove newline from ctime
-    if (len > 0 && json_buffer[len-2] == '\n') {
-        json_buffer[len-2] = '"';
-        json_buffer[len-1] = '\n';
-    }
-    
     // Send header first
     send_response_optimized(client_fd, &STATS_HEADER, worker->stats);
     
@@ -418,4 +453,5 @@ void send_stats_response_optimized(int client_fd, worker_thread_t *worker) {
     if (sent > 0) {
         atomic_fetch_add(&worker->stats->bytes_sent, sent);
     }
+}
 }

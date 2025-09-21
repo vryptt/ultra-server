@@ -1,7 +1,10 @@
 #ifndef ULTRA_SERVER_H
 #define ULTRA_SERVER_H
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,9 +24,24 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
-#include <linux/perf_event.h>
 #include <sys/ioctl.h>
-#include <immintrin.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <stdint.h>
+
+// Try to include SIMD headers if available
+#ifdef __x86_64__
+  #ifdef __has_include
+    #if __has_include(<immintrin.h>)
+      #include <immintrin.h>
+      #define HAS_SIMD 1
+    #endif
+  #endif
+#endif
+
+#ifndef HAS_SIMD
+  #define HAS_SIMD 0
+#endif
 
 // Performance Configuration
 #define PORT 8080
@@ -127,6 +145,29 @@ void init_stats(server_stats_t *stats);
 void init_ring_buffer(ring_buffer_t *buffer);
 void *allocate_from_pool(worker_thread_t *worker, size_t size);
 void prefetch_data(const void *addr);
+void send_stats_response_optimized(int client_fd, worker_thread_t *worker);
+
+// Portable prefetch function
+static inline void prefetch_data_inline(const void *addr) {
+#if HAS_SIMD && defined(__GNUC__)
+    __builtin_prefetch(addr, 0, 3);
+#else
+    (void)addr; // Suppress unused parameter warning
+#endif
+}
+
+// Portable CPU timestamp counter
+static inline uint64_t get_cpu_cycles(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    uint32_t hi, lo;
+    __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+#endif
+}
 
 // Lock-free ring buffer operations
 static inline int ring_buffer_push(ring_buffer_t *buffer, const connection_t *conn) {
@@ -154,18 +195,22 @@ static inline int ring_buffer_pop(ring_buffer_t *buffer, connection_t *conn) {
     return 1;
 }
 
-// Fast string matching using SIMD
+// Fast string matching using optimized comparison
 static inline int fast_path_match(const char *buffer, size_t len) {
     if (len < 14) return -1;
     
-    // Check "GET " using 32-bit comparison
-    if (*(uint32_t*)buffer != 0x20544547) return -1; // "GET " in little-endian
+    // Check "GET " using 32-bit comparison - more portable
+    if (buffer[0] != 'G' || buffer[1] != 'E' || buffer[2] != 'T' || buffer[3] != ' ') {
+        return -1;
+    }
     
     // Fast path for "GET /"
     if (buffer[4] == '/' && buffer[5] == ' ') return 0;
     
     // Fast path for "GET /stats"
-    if (len >= 20 && *(uint64_t*)(buffer + 4) == 0x73746174732f2f) {
+    if (len >= 20 && buffer[4] == '/' && buffer[5] == 's' && buffer[6] == 't' && 
+        buffer[7] == 'a' && buffer[8] == 't' && buffer[9] == 's' && 
+        (buffer[10] == ' ' || buffer[10] == '\r' || buffer[10] == '\n')) {
         return 1;
     }
     
