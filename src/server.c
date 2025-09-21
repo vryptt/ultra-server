@@ -343,49 +343,6 @@ void send_response_optimized(int client_fd, const response_t *response, server_s
 }
 
 void send_stats_response_optimized(int client_fd, worker_thread_t *worker) {
-    (void)client_fd;
-    char *json_buffer = (char*)allocate_from_pool(worker, 4096);
-    time_t current_time = time(NULL);
-    double uptime = difftime(current_time, worker->stats->start_time);
-    
-    // Build comprehensive JSON response
-    int len = snprintf(json_buffer, 4096,
-        "{\n"
-        "  \"server\": \"Ultra-Fast Multi-Core HTTP Server\",\n"
-        "  \"version\": \"2.0\",\n"
-        "  \"uptime_seconds\": %.0f,\n"
-        "  \"performance\": {\n"
-        "    \"total_requests\": %lu,\n"
-        "    \"get_requests\": %lu,\n"
-        "    \"stats_requests\": %lu,\n"
-        "    \"requests_per_second\": %lu,\n"
-        "    \"bytes_sent\": %lu,\n"
-        "    \"bytes_received\": %lu\n"
-        "  },\n"
-        "  \"connections\": {\n"
-        "    \"active\": %lu,\n"
-        "    \"peak\": %lu\n"
-        "  },\n"
-        "  \"system\": {\n"
-        "    \"worker_threads\": %d,\n"
-        "    \"cpu_cores\": %d,\n"
-        "    \"cache_hits\": %lu,\n"
-        "    \"cache_misses\": %lu,\n"
-        "    \"memory_allocations\": %lu\n"
-        "  },\n"
-        "  \"errors\": {\n"
-        "    \"total_errors\": %lu,\n"
-        "    \"error_rate\": %.2f\n"
-        "  },\n"
-        "  \"thread_stats\": {\n"
-        "    \"thread_id\": %d,\n"
-        "    \"local_requests\": %lu,\n"
-        "    \"local_bytes_sent\": %lu\n"
-        "  },\n"
-        "  \"timestamp\": \"%s\"\n"
-        "}\n",
-void send_stats_response_optimized(int client_fd, worker_thread_t *worker) {
-    (void)client_fd;
     char *json_buffer = (char*)allocate_from_pool(worker, 4096);
     time_t current_time = time(NULL);
     double uptime = difftime(current_time, worker->stats->start_time);
@@ -456,5 +413,4 @@ void send_stats_response_optimized(int client_fd, worker_thread_t *worker) {
     if (sent > 0) {
         atomic_fetch_add(&worker->stats->bytes_sent, sent);
     }
-}
 }
