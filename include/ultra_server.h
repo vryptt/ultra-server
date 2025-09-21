@@ -28,6 +28,7 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 // Try to include SIMD headers if available
 #ifdef __x86_64__
@@ -49,15 +50,14 @@
 #define BUFFER_SIZE 8192
 #define MAX_CONNECTIONS 65536
 #define BACKLOG 65536
-#define SO_REUSEPORT_LB 512
 
 // Thread Pool Configuration
 #define MAX_WORKER_THREADS 32
 #define MAX_IO_THREADS 8
-#define THREAD_STACK_SIZE (1024 * 1024)
+#define THREAD_STACK_SIZE (2 * 1024 * 1024)  // 2MB stack
 
 // Memory Pool Configuration
-#define MEMORY_POOL_SIZE (64 * 1024 * 1024)
+#define MEMORY_POOL_SIZE (64 * 1024 * 1024)  // 64MB per worker
 #define CONNECTION_POOL_SIZE 32768
 
 // Cache Line Optimization
@@ -68,64 +68,74 @@
 #define RING_BUFFER_SIZE 65536
 #define RING_BUFFER_MASK (RING_BUFFER_SIZE - 1)
 
+// Server statistics structure
 typedef struct ALIGNED {
-    atomic_ulong total_requests;
-    atomic_ulong get_requests;
-    atomic_ulong stats_requests;
-    atomic_ulong active_connections;
-    atomic_ulong bytes_sent;
-    atomic_ulong bytes_received;
-    atomic_ulong error_count;
-    atomic_ulong peak_connections;
-    atomic_ulong request_rate;
+    atomic_uint_fast64_t total_requests;
+    atomic_uint_fast64_t get_requests;
+    atomic_uint_fast64_t stats_requests;
+    atomic_uint_fast64_t active_connections;
+    atomic_uint_fast64_t bytes_sent;
+    atomic_uint_fast64_t bytes_received;
+    atomic_uint_fast64_t error_count;
+    atomic_uint_fast64_t peak_connections;
+    atomic_uint_fast64_t request_rate;
     time_t start_time;
-    
+
     // Performance counters
-    atomic_ulong cache_hits;
-    atomic_ulong cache_misses;
-    atomic_ulong thread_switches;
-    atomic_ulong memory_allocations;
+    atomic_uint_fast64_t cache_hits;
+    atomic_uint_fast64_t cache_misses;
+    atomic_uint_fast64_t thread_switches;
+    atomic_uint_fast64_t memory_allocations;
 } server_stats_t;
 
+// Connection structure for ring buffer
 typedef struct ALIGNED {
     int client_fd;
     struct sockaddr_in client_addr;
     uint64_t timestamp;
 } connection_t;
 
+// Lock-free ring buffer
 typedef struct ALIGNED {
-    atomic_uint head;
-    atomic_uint tail;
+    atomic_uint_fast32_t head;
+    atomic_uint_fast32_t tail;
     connection_t connections[RING_BUFFER_SIZE];
 } ring_buffer_t;
 
-typedef struct ALIGNED {
+// Forward declarations for circular dependencies
+typedef struct worker_thread worker_thread_t;
+typedef struct io_thread io_thread_t;
+
+// Worker thread structure
+struct worker_thread {
+    pthread_t thread;
     int thread_id;
     int cpu_id;
     int epoll_fd;
+    int event_fd;
     server_stats_t *stats;
     ring_buffer_t *ring_buffer;
-    
+
     // Per-thread statistics
-    atomic_ulong local_requests;
-    atomic_ulong local_bytes_sent;
-    
+    atomic_uint_fast64_t local_requests;
+    atomic_uint_fast64_t local_bytes_sent;
+
     // Memory pool
     void *memory_pool;
     size_t pool_offset;
-    
-    // Event notification
-    int event_fd;
-} worker_thread_t;
+} ALIGNED;
 
-typedef struct ALIGNED {
+// I/O thread structure
+struct io_thread {
+    pthread_t thread;
+    int thread_id;
     int server_fd;
     int epoll_fd;
     server_stats_t *stats;
     ring_buffer_t *ring_buffer;
     worker_thread_t *workers;
     int num_workers;
-} io_thread_t;
+} ALIGNED;
 
 // Pre-compiled responses for zero-copy
 typedef struct {
@@ -141,11 +151,11 @@ void *io_thread_func(void *arg);
 void *worker_thread_func(void *arg);
 void handle_client_optimized(int client_fd, worker_thread_t *worker);
 void send_response_optimized(int client_fd, const response_t *response, server_stats_t *stats);
+void send_stats_response_optimized(int client_fd, worker_thread_t *worker);
 void init_stats(server_stats_t *stats);
 void init_ring_buffer(ring_buffer_t *buffer);
 void *allocate_from_pool(worker_thread_t *worker, size_t size);
 void prefetch_data(const void *addr);
-void send_stats_response_optimized(int client_fd, worker_thread_t *worker);
 
 // Portable prefetch function
 static inline void prefetch_data_inline(const void *addr) {
@@ -169,58 +179,66 @@ static inline uint64_t get_cpu_cycles(void) {
 #endif
 }
 
-// Lock-free ring buffer operations
-static inline int ring_buffer_push(ring_buffer_t *buffer, const connection_t *conn) {
+// Lock-free ring buffer operations with proper memory ordering
+static inline bool ring_buffer_push(ring_buffer_t *buffer, const connection_t *conn) {
     uint32_t head = atomic_load_explicit(&buffer->head, memory_order_relaxed);
     uint32_t next_head = (head + 1) & RING_BUFFER_MASK;
-    
+
     if (next_head == atomic_load_explicit(&buffer->tail, memory_order_acquire)) {
-        return 0; // Buffer full
+        return false; // Buffer full
     }
-    
+
     buffer->connections[head] = *conn;
     atomic_store_explicit(&buffer->head, next_head, memory_order_release);
-    return 1;
+    return true;
 }
 
-static inline int ring_buffer_pop(ring_buffer_t *buffer, connection_t *conn) {
+static inline bool ring_buffer_pop(ring_buffer_t *buffer, connection_t *conn) {
     uint32_t tail = atomic_load_explicit(&buffer->tail, memory_order_relaxed);
-    
+
     if (tail == atomic_load_explicit(&buffer->head, memory_order_acquire)) {
-        return 0; // Buffer empty
+        return false; // Buffer empty
     }
-    
+
     *conn = buffer->connections[tail];
     atomic_store_explicit(&buffer->tail, (tail + 1) & RING_BUFFER_MASK, memory_order_release);
-    return 1;
+    return true;
 }
 
-// Fast string matching using optimized comparison
+// Fast string matching with optimized HTTP request parsing
 static inline int fast_path_match(const char *buffer, size_t len) {
-    if (len < 14) return -1;
+    // Minimum "GET / HTTP/1.1\r\n" = 16 bytes
+    if (len < 16) return -1;
+
+    // Check "GET " using 32-bit comparison for better performance
+    const uint32_t *get_check = (const uint32_t*)buffer;
+    const uint32_t get_pattern = 0x20544547; // "GET " in little-endian
     
-    // Check "GET " using 32-bit comparison - more portable
-    if (buffer[0] != 'G' || buffer[1] != 'E' || buffer[2] != 'T' || buffer[3] != ' ') {
+    if (*get_check != get_pattern) {
         return -1;
     }
-    
-    // Fast path for "GET /"
-    if (buffer[4] == '/' && buffer[5] == ' ') return 0;
-    
+
+    // Fast path for "GET / " (root endpoint)
+    if (buffer[4] == '/' && (buffer[5] == ' ' || buffer[5] == '\t')) {
+        return 0;
+    }
+
     // Fast path for "GET /stats"
-    if (len >= 20 && buffer[4] == '/' && buffer[5] == 's' && buffer[6] == 't' && 
-        buffer[7] == 'a' && buffer[8] == 't' && buffer[9] == 's' && 
-        (buffer[10] == ' ' || buffer[10] == '\r' || buffer[10] == '\n')) {
+    if (len >= 20 && buffer[4] == '/' && 
+        buffer[5] == 's' && buffer[6] == 't' && buffer[7] == 'a' && 
+        buffer[8] == 't' && buffer[9] == 's' &&
+        (buffer[10] == ' ' || buffer[10] == '\t' || buffer[10] == '?' || 
+         buffer[10] == '\r' || buffer[10] == '\n')) {
         return 1;
     }
-    
-    return -1;
+
+    return -1; // Unknown endpoint
 }
 
-// Pre-compiled responses
+// Pre-compiled responses (extern declarations)
 extern const response_t ROOT_RESPONSE;
 extern const response_t STATS_HEADER;
 extern const response_t NOT_FOUND_RESPONSE;
 extern const response_t BAD_REQUEST_RESPONSE;
 
-#endif
+#endif // ULTRA_SERVER_H
