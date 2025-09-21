@@ -335,6 +335,72 @@ cleanup:
     atomic_fetch_sub(&worker->stats->active_connections, 1);
 }
 
+// Fast path request matching function
+int fast_path_match(const char *buffer, size_t len) {
+    // Check minimum length for HTTP request
+    if (len < 14) return -1; // "GET / HTTP/1.1"
+    
+    // Quick check for GET method
+    if (buffer[0] != 'G' || buffer[1] != 'E' || buffer[2] != 'T' || buffer[3] != ' ') {
+        return -1;
+    }
+    
+    // Check for root path "GET / "
+    if (buffer[4] == '/' && buffer[5] == ' ') {
+        return 0; // Root endpoint
+    }
+    
+    // Check for stats path "GET /stats"
+    if (len >= 18 && buffer[4] == '/' && 
+        buffer[5] == 's' && buffer[6] == 't' && buffer[7] == 'a' && 
+        buffer[8] == 't' && buffer[9] == 's' && 
+        (buffer[10] == ' ' || buffer[10] == '?')) {
+        return 1; // Stats endpoint
+    }
+    
+    return -1; // Unknown endpoint
+}
+
+// Ring buffer operations
+bool ring_buffer_push(ring_buffer_t *buffer, const connection_t *conn) {
+    uint32_t head = atomic_load(&buffer->head);
+    uint32_t next_head = (head + 1) % RING_BUFFER_SIZE;
+    
+    if (next_head == atomic_load(&buffer->tail)) {
+        return false; // Buffer full
+    }
+    
+    buffer->connections[head] = *conn;
+    atomic_store(&buffer->head, next_head);
+    return true;
+}
+
+bool ring_buffer_pop(ring_buffer_t *buffer, connection_t *conn) {
+    uint32_t tail = atomic_load(&buffer->tail);
+    
+    if (tail == atomic_load(&buffer->head)) {
+        return false; // Buffer empty
+    }
+    
+    *conn = buffer->connections[tail];
+    atomic_store(&buffer->tail, (tail + 1) % RING_BUFFER_SIZE);
+    return true;
+}
+
+// CPU cycle counter for performance timing
+uint64_t get_cpu_cycles(void) {
+#ifdef __x86_64__
+    uint32_t lo, hi;
+    __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
+    return ((uint64_t)hi << 32) | lo;
+#else
+    // Fallback for other architectures
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+#endif
+}
+
 void send_response_optimized(int client_fd, const response_t *response, server_stats_t *stats) {
     ssize_t sent = send(client_fd, response->data, response->length, MSG_DONTWAIT | MSG_NOSIGNAL);
     if (sent > 0) {
