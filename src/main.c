@@ -45,7 +45,8 @@ static void setup_signal_handling(void) {
     signal(SIGINT, SIG_DFL);
 }
 
-int main(int argc, char *argv[]) {
+//int main(int argc, char *argv[]) {
+init main(void) {
     printf("Ultra-Fast Multi-Core HTTP Server v2.0\n");
     printf("=======================================\n");
     
